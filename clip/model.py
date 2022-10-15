@@ -66,10 +66,14 @@ class AttentionPool2d(nn.Module):
         self.num_heads = num_heads
 
     def forward(self, x):
+        
+        print(f"num_heads - {self.num_heads}")
+
         x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
         x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
-        x, _ = F.multi_head_attention_forward(
+        # x, _ = F.multi_head_attention_forward(
+        x, attn_output_weights = F.multi_head_attention_forward(
             query=x[:1], key=x, value=x,
             embed_dim_to_check=x.shape[-1],
             num_heads=self.num_heads,
@@ -86,9 +90,13 @@ class AttentionPool2d(nn.Module):
             out_proj_bias=self.c_proj.bias,
             use_separate_proj_weight=True,
             training=self.training,
-            need_weights=False
+            # need_weights=False
+            need_weights=True,
+            average_attn_weights=False #True #returns attention weights averaged across heads of shape :math:`(L, S)`
         )
-        return x.squeeze(0)
+        print(f"AttentionPool2d - {x.shape}")
+        print(f"attn_output_weights - {attn_output_weights.shape}")
+        return x.squeeze(0), attn_output_weights
 
 
 class ModifiedResNet(nn.Module):
@@ -145,14 +153,73 @@ class ModifiedResNet(nn.Module):
 
         x = x.type(self.conv1.weight.dtype)
         x = stem(x)
+        print(f"stem out = {x.shape}")
         x = self.layer1(x)
+        print(f"layer1 out = {x.shape}")
         x = self.layer2(x)
+        print(f"layer2 out = {x.shape}")
         x = self.layer3(x)
+        print(f"layer3 out = {x.shape}")
         x = self.layer4(x)
-        x = self.attnpool(x)
+        print(f"layer4 out = {x.shape}")
+        # x = self.attnpool(x)
 
-        return x
+        # return x
 
+        # x_a = self.attnpool(x)
+
+        # print(f"GRG: {x.shape}")
+        # x = x.permute(0, 2, 3, 1) 
+        # print(f"GRG: x-permute {x.shape}")
+
+        # x = self.attnpool.c_proj(x)
+
+        # return (x_a, x)
+
+        x_a, attn_output_weights = self.attnpool(x)
+        print(f"model attn_output_weights - {attn_output_weights.shape}")
+        
+        x_s = x.clone()
+        n,c,h,w = x_s.shape
+        print(f"GRG: {x_s.shape}")
+        
+        '''
+        stem out = torch.Size([1, 128, 112, 112])
+        layer1 out = torch.Size([1, 512, 112, 112])
+        layer2 out = torch.Size([1, 1024, 56, 56])
+        layer3 out = torch.Size([1, 2048, 28, 28])
+        layer4 out = torch.Size([1, 4096, 14, 14])
+        num_heads - 64
+        AttentionPool2d - torch.Size([1, 1, 1024])
+        GRG: torch.Size([1, 4096, 14, 14])
+        GRG: x-reshape torch.Size([196, 4096, 1, 1])
+        '''
+
+        # x_s = x_s.reshape(n*h*w, c, 1, 1)  #This is wrong
+        '''
+        Since the head and batch dimension are not next to each other, 
+        we need to transpose before we reshape. 
+        (This is costly, but it seems to be unavoidable.)
+
+        keys = keys.transpose(1, 2).contiguous().view(b * h, t, k)
+        
+        '''
+        # x_s = x_s.permute(0,2,3,1).contiguous().view(n*h*w, c, 1, 1)
+        x_s = x_s.permute(0,2,3,1).contiguous().view(n*h*w, c)
+        print(f"GRG: x-reshape {x_s.shape}")
+
+
+        # x_s = self.attnpool(x_s)
+
+        print(f"Pos embed size = {self.attnpool.positional_embedding[:, None, :].shape}")
+        # print(f"Pos embed size = {(x_s + self.attnpool.positional_embedding[1:, :]).shape}")
+        x_s = x_s + self.attnpool.positional_embedding[1:, :].to(x_s.dtype)  # (HW+1)NC
+        x_s = self.attnpool.v_proj(x_s)
+        print(f"GRG: v_proj x-reshape {x_s.shape}")
+        x_s = self.attnpool.c_proj(x_s)
+        print(f"GRG: c_proj x-reshape {x_s.shape}")
+
+        return (x_a, x_s, attn_output_weights)
 
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
